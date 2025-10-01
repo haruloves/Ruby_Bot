@@ -1,5 +1,6 @@
 **디스코드 초대(Invite) 링크**  
 [https://url.kr/j88e9o](https://url.kr/j88e9o)  
+명령어들은 "/도움말" 을 입력해주세요.    
 > (현재는 Gemini-2.5-Flash 기반 '2.8v'만 운영합니다.)
 　  
 
