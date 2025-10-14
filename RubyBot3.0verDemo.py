@@ -447,10 +447,11 @@ async def schedule_reminder(reminder_data):
 # =======================
 # 자동 실행 작업 (Tasks)
 # =======================
-@tasks.loop(minutes=15)
+@tasks.loop(hours=2)
 async def periodic_time_check():
-    """15분마다 현재 한국 표준시를 기록하여 시간 동기화를 확인합니다."""
-    log.info(f"[시간 재검증] 현재 KST 시각: {get_kst_now().strftime('%Y-%m-%d %H:%M:%S')}")
+    """2시간마다 한국 시간을 자체적으로 체크합니다."""
+    _ = get_kst_now()
+    log.debug(f"[NO_DISCORD] [시간 재검증] KST: {get_kst_now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 @periodic_time_check.before_loop
 async def before_periodic_time_check():
