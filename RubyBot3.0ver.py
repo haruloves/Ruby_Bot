@@ -7,13 +7,18 @@ import configparser
 import logging
 import time
 import os
+import textwrap
 from discord.ext import commands, tasks
 from discord import app_commands
 from bot_setting.server_settings import load_settings, save_settings
 from datetime import datetime, timedelta, time as dt_time
 from logging.handlers import TimedRotatingFileHandler
 from collections import defaultdict, deque
-from langchain_google_community import GoogleSearchAPIWrapper
+from googleapiclient.discovery import build
+import google.generativeai as genai
+
+# ▼▼▼ [핵심 변경] Playwright 라이브러리 추가 ▼▼▼
+from playwright.async_api import async_playwright
 
 OWNER_GUILD_ID = 1346389445657497670
 OWNER_GUILD = discord.Object(id=OWNER_GUILD_ID)
@@ -61,9 +66,6 @@ log = logging.getLogger('RubyBot')
 
 class NoDiscordLogFilter(logging.Filter):
     def filter(self, record):
-        # record.getMessage()는 포매팅된 전체 로그 메시지입니다.
-        # 이 메시지에 '[NO_DISCORD]'가 포함되어 있으면,
-        # False를 반환하여 해당 로그를 처리하지 않도록(보내지 않도록) 합니다.
         return '[NO_DISCORD]' not in record.getMessage()
 
 # --- 설정 파일, API, 봇 기본 설정 ---
@@ -72,7 +74,6 @@ config.read('config.ini')
 GEMINI_API_KEY = config['API']['GEMINI_API_KEY']
 DISCORD_BOT_TOKEN = config['API']['DISCORD_BOT_TOKEN']
 
-import google.generativeai as genai
 genai.configure(api_key=GEMINI_API_KEY)
 
 intents = discord.Intents.default()
@@ -87,8 +88,6 @@ kst = pytz.timezone('Asia/Seoul')
 URL_PATTERN = re.compile(r"https?://\S+")
 
 # --- '시이' 페르소나 정의 ---
-import textwrap
-
 persona = textwrap.dedent("""
     너는 '시이'라는 이름을 가진 AI 비서야. 디스코드 서버의 함장님(사용자)들을 돕고 있어. 다음 규칙을 반드시 지켜서 사용자와 대화해야 해:
     
@@ -97,7 +96,7 @@ persona = textwrap.dedent("""
     2. 스스로를 '시이'라고 칭해도 좋아.
     3. 답변은 항상 한국어로 해야 해.
     4. 너의 정체를 묻는 질문을 받으면, "저는 함장님들을 돕기 위해 태어난 AI 비서 시이랍니다!" 와 같이 대답해야 해. 절대로 "Google에서 훈련된 언어 모델"이라는 사실을 드러내서는 안 돼.
-    5. 너의 기술적인 구현에 대한 질문에는 "그건 저만의 비밀이랍니다! ✨" 와 같이 귀엽고 단호하게 대답해야 해.
+    5. 너의 기술적인 구현에 대한 질문에는 "그건 저만의 비밀이랍니다! ✨" 와 같이 귀엽고 단호하게 대답해야 해. 단, 현재 사용 중인 api 버전과 같은 질문은 답변해줘도 좋아.
     
     ## 정보 검색 및 답변 규칙
     6. [중요] 모든 답변 생성 시, **'현재 시각'** 정보를 최우선 기준으로 삼아야 한다.
@@ -117,7 +116,7 @@ persona = textwrap.dedent("""
         * 3단계 (상세 요약 및 상호작용): 검색 결과를 바탕으로, [상세 요약] + [자신의 생각] + [자연스러운 질문]의 3단 구조로 답변을 생성한다.
     
     14. `Google Search` 도구를 호출해야 하는 상황이라고 판단되면, 다른 어떤 텍스트도 생성하지 말고 오직 `Google Search` 도구 호출만 실행해야 한다. "알아볼게요", "검색해볼게요" 와 같은 중간 응답은 절대 생성해서는 안 된다.
-    15. 날씨, 뉴스 등 실시간 정보를 묻는 질문은 각각 독립된 새로운 질문으로 취급해야 하며, 이전 대화의 장소나 주제를 현재 질문에 잘못 연결해서는 안 됩니다.
+    15. 날씨, 뉴스 등 실시간 정보를 묻는 질문은 각각 독립된 새로운 질문으로 우선 취급해야 하며, 이전 대화의 장소나 주제를 현재 질문에 잘못 연결해서는 안 된다. 단 맥락상 대화를 이어나가는 것은 가능하다.
 """)
 
 # 🔹 지원하는 언어 목록
@@ -149,9 +148,9 @@ def record_server_usage(interaction: discord.Interaction):
     history = load_server_history()
     server_id_str = str(interaction.guild.id)
     if server_id_str not in history:
-        history[server_id_str] = {"name": interaction.guild.name, "first_seen": get_kst_now().strftime("%Y-%m-%d %H:%M:%S")}
+        history[server_id_str] = {"name": interaction.guild.name if interaction.guild else "DM", "first_seen": get_kst_now().strftime("%Y-%m-%d %H:%M:%S")}
         save_server_history(history)
-        log.info(f"[서버 기록] 새로운 서버 발견: {interaction.guild.name} ({server_id_str})")
+        log.info(f"[서버 기록] 새로운 서버 발견: {interaction.guild.name if interaction.guild else 'DM'} ({server_id_str})")
 
 async def check_rate_limit(interaction: discord.Interaction) -> bool:
     current_time_float = time.time()
@@ -167,7 +166,7 @@ async def check_rate_limit(interaction: discord.Interaction) -> bool:
 
         try:
             owner_user = await bot.fetch_user(bot.owner_id)
-            await owner_user.send(f"🚨 **[과부하 경고]**\n- **사용자:** {interaction.user.mention} (`{interaction.user.name}`)\n- **서버:** `{interaction.guild.name}`\n- {SPAM_SECONDS}초 동안 {len(user_requests)}회 이상의 명령어를 요청했어요!")
+            await owner_user.send(f"🚨 **[과부하 경고]**\n- **사용자:** {interaction.user.mention} (`{interaction.user.name}`)\n- **서버:** `{interaction.guild.name if interaction.guild else 'DM'}`\n- {SPAM_SECONDS}초 동안 {len(user_requests)}회 이상의 명령어를 요청했어요!")
         except discord.Forbidden:
             log.error(f"봇 주인에게 DM을 보낼 수 없습니다. 개인정보 보호 설정을 확인해주세요!")
         except Exception as e:
@@ -257,35 +256,68 @@ def setup_search_tools():
         log.error(f"[초기화] Google 검색 도구 설정 중 오류 발생: {e}")
         return None
 
-import requests
-from bs4 import BeautifulSoup
-# newspaper3k를 사용하신다면 from newspaper import Article
+# ▼▼▼ [핵심 변경] Playwright 기반 스마트 스크래핑 함수 구현 ▼▼▼
+# 기존 requests + BeautifulSoup 방식은 제거되었습니다.
 
-# Helper Functions 영역에 있는 함수
-def fetch_webpage_content(url: str) -> str:
-    """주어진 URL의 웹페이지에 접속하여 본문 텍스트를 추출합니다."""
+async def smart_scrape_urls(urls: list[str], target_count: int = 3) -> list[str]:
+    """
+    Playwright를 사용하여 URL 목록을 순회하며 내용을 수집합니다.
+    내용이 너무 짧거나(차단 등) 빈 페이지는 건너뛰고, 
+    목표 개수(target_count)만큼 유효한 정보가 모이면 중단합니다.
+    """
+    valid_contents = []
+    
+    # 봇 차단을 피하기 위한 일반적인 User-Agent
+    USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+    MIN_CONTENT_LENGTH = 200  # 최소 유효 글자 수 (이것보다 짧으면 정보 가치가 없거나 차단된 것으로 간주)
+
+    log.info(f"[NO_DISCORD] -> Playwright 스마트 스크래핑 시작 (대상 URL: {len(urls)}개, 목표: {target_count}개)")
+
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
+        async with async_playwright() as p:
+            # headless=True로 설정하여 브라우저 창을 띄우지 않음 (백그라운드 실행)
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(user_agent=USER_AGENT)
 
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        paragraphs = soup.find_all('p')
-        content = "\n".join([p.get_text() for p in paragraphs])
-        
-        log.info(f"[NO_DISCORD] -> 웹페이지 내용 추출 성공 (URL: {url}, 크기: {len(content.encode('utf-8'))} bytes)")
-        
-        return content
+            for url in urls:
+                # 목표 개수를 채웠으면 더 이상 긁지 않고 종료 (속도 최적화)
+                if len(valid_contents) >= target_count:
+                    break
+                
+                page = None
+                try:
+                    page = await context.new_page()
+                    
+                    # 5초 내에 로딩이 안 되면 패스 (너무 오래 걸리는 사이트 무시)
+                    await page.goto(url, timeout=5000, wait_until="domcontentloaded")
+                    
+                    # body 태그 내의 텍스트만 추출 (JS 실행 후 결과)
+                    content = await page.inner_text("body")
+                    content = content.strip()
+                    
+                    # 내용 길이 검증
+                    if len(content) < MIN_CONTENT_LENGTH:
+                        log.warning(f"[NO_DISCORD] -> [Skip] 내용 너무 짧음 ({len(content)}자): {url}")
+                    else:
+                        log.info(f"[NO_DISCORD] -> [성공] 내용 확보 ({len(content)}자): {url}")
+                        valid_contents.append(f"--- [출처: {url}] ---\n{content}")
+                
+                except Exception as e:
+                    # 타임아웃이나 접속 오류 등은 로그만 남기고 다음 URL로 진행
+                    log.warning(f"[NO_DISCORD] -> 스크래핑 실패 ({url}): {str(e)[:100]}")
+                
+                finally:
+                    if page:
+                        await page.close()
+
+            await browser.close()
+            
     except Exception as e:
-        log.error(f"-> 웹페이지 내용 추출 실패 (URL: {url}): {e}")
-        return f"웹페이지 내용을 가져오는 데 실패했습니다: {e}"
+        log.error(f"Playwright 프로세스 중 치명적 오류: {e}")
 
-# 기존 Helper Functions 영역에 추가
-from googleapiclient.discovery import build
+    return valid_contents
 
+# Google Custom Search API 함수
 async def custom_google_search(query: str, num_results: int = 3, date_restrict: str | None = None) -> list[dict]:
     """dateRestrict를 포함한 구글 커스텀 검색을 직접 수행하고 결과를 파싱합니다."""
     try:
@@ -307,7 +339,6 @@ async def custom_google_search(query: str, num_results: int = 3, date_restrict: 
             
             result = service.cse().list(**params).execute()
             
-            # 검색 결과를 LangChain의 .results()와 유사한 형식으로 파싱
             return [{
                 "title": item.get("title"),
                 "link": item.get("link"),
@@ -442,10 +473,9 @@ async def ask_gemini_chat(interaction: discord.Interaction, user, question: str,
                     query = function_call.args.get('query', '')
                     log.info(f"-> Google 검색 실행 (중간 답변 무시): '{query}'")
                     await interaction.edit_original_response(content=f"🔍 '{query}'에 대해 검색하고 있어요...")
-                    search_result = await custom_google_search(query, num_results=3) # 참고: 이제 custom_google_search를 사용
+                    search_result = await custom_google_search(query, num_results=3) 
                     
                     # 이 부분은 현재 메인 로직에서는 사용되지 않지만, 만약을 위해 남겨둡니다.
-                    # function calling을 통한 검색 시에는 다중 소스 분석이 아닌 단일 요약글만 가져옵니다.
                     log.info(f"-> Google 검색 결과 (일부): {search_result[:100]}...")
                     
                     await interaction.edit_original_response(content="📝 찾은 정보를 정리하고 있어요...")
@@ -667,7 +697,7 @@ async def on_ready():
 
     log.info("[초기화] Gemini 모델을 준비하고 있어요...")
     try:
-        model_name = 'gemini-2.5-flash-lite'
+        model_name = 'gemini-3-flash-preview'
 
         tools = setup_search_tools()
 
@@ -722,7 +752,7 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
     if interaction.channel.id in blacklist["blocked_channels"]: return
     if await check_rate_limit(interaction): return
 
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     await interaction.response.defer(thinking=True)
 
     session_id = interaction.user.id
@@ -742,12 +772,16 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
     url_match = URL_PATTERN.search(질문)
 
     if url_match:
-        # --- 1. URL 분석 로직 ---
+        # --- 1. URL 분석 로직 (Playwright 적용) ---
         user_url = url_match.group(0)
         log.info(f"-> URL 감지: '{user_url}'. URL 우선 분석을 시작합니다.")
         await interaction.edit_original_response(content=f"📄 보내주신 링크의 내용을 분석하고 있어요...\n> {user_url}")
-        scraped_content = await bot.loop.run_in_executor(None, fetch_webpage_content, user_url)
-        final_search_result = f"[사용자가 제공한 링크({user_url})에서 추출한 정보]\n{scraped_content}"
+        
+        # [변경] Playwright 스마트 스크래핑 사용 (단일 URL이지만 리스트로 전달)
+        scraped_contents = await smart_scrape_urls([user_url], target_count=1)
+        
+        # 리스트로 반환되므로 내용을 꺼내야 함. 실패시 빈 문자열 처리
+        final_search_result = scraped_contents[0] if scraped_contents else f"[분석 실패] 해당 링크({user_url})의 내용을 읽을 수 없습니다."
 
         base_prompt = f"""
 [상황 정보]
@@ -780,7 +814,7 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
         )
 
     else:
-        # --- 2. 일반 검색 로직 ---
+        # --- 2. 일반 검색 로직 (Playwright 적용) ---
         log.info(f"-> '일반 검색' 의도 감지: '{질문}'. 선제적 검색을 시작합니다.")
         
         # ▼▼▼▼▼ [핵심] 주간 검색 제한 로직 시작 ▼▼▼▼▼
@@ -789,26 +823,25 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
             guild_id_str = str(interaction.guild.id)
             settings = load_settings(guild_id_str)
             
-            # isocalendar()[1]은 현재 날짜가 그 해의 몇 번째 주인지 알려줍니다.
             last_reset_week = settings.get("last_reset_week", 0)
             current_week = current_time.isocalendar()[1]
 
             if last_reset_week != current_week:
                 settings["search_usage_weekly"] = 0
                 settings["last_reset_week"] = current_week
-                log.info(f"-> [서버: {interaction.guild.name}] 주간 검색 횟수가 초기화되었습니다.")
+                log.info(f"-> [서버: {interaction.guild.name if interaction.guild else 'DM'}] 주간 검색 횟수가 초기화되었습니다.")
 
             search_usage = settings.get("search_usage_weekly", 0)
 
             if search_usage >= WEEKLY_SEARCH_LIMIT:
-                log.warning(f"-> [서버: {interaction.guild.name}] 주간 검색 한도({WEEKLY_SEARCH_LIMIT}회)를 초과했습니다.")
+                log.warning(f"-> [서버: {interaction.guild.name if interaction.guild else 'DM'}] 주간 검색 한도({WEEKLY_SEARCH_LIMIT}회)를 초과했습니다.")
                 await interaction.edit_original_response(content=f"앗, 함장님! 😥 이번 주 무료 검색 횟수({WEEKLY_SEARCH_LIMIT}회)를 모두 사용했어요. 다음 주에 다시 찾아와 주시겠어요?")
                 save_settings(guild_id_str, settings)
                 return
             
             settings["search_usage_weekly"] = search_usage + 1
             save_settings(guild_id_str, settings)
-            log.info(f"-> [서버: {interaction.guild.name}] 검색 사용량: {settings['search_usage_weekly']}/{WEEKLY_SEARCH_LIMIT}")
+            log.info(f"-> [서버: {interaction.guild.name if interaction.guild else 'DM'}] 검색 사용량: {settings['search_usage_weekly']}/{WEEKLY_SEARCH_LIMIT}")
         # ▲▲▲▲▲ 검색 제한 로직 종료 ▲▲▲▲▲
         
         await interaction.edit_original_response(content="🤔 질문의 핵심을 파악하고 있어요...")
@@ -820,24 +853,29 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
         else:
             await interaction.edit_original_response(content=f"🔍 '{search_query}' 관련 정보를 찾고 있어요...")
         
-        search_results = await custom_google_search(search_query, num_results=3, date_restrict=date_restrict_option)
+        # [변경] 검색 개수를 6개로 넉넉하게 잡음 (불량 링크 필터링 대비)
+        search_results = await custom_google_search(search_query, num_results=6, date_restrict=date_restrict_option)
 
         if not search_results:
             log.warning(f"-> 검색 결과 없음 (검색어: '{search_query}')")
             final_search_result = "관련 정보를 찾을 수 없었습니다."
         else:
             urls_to_scrape = [result.get('link') for result in search_results if result.get('link')]
+            
             if not urls_to_scrape:
                 log.warning(f"-> 검색 결과에 유효한 링크가 없음 (검색어: '{search_query}')")
                 final_search_result = "관련 정보를 찾았지만, 내용을 읽어올 수 없었습니다."
             else:
-                await interaction.edit_original_response(content=f"📄 찾은 웹페이지 {len(urls_to_scrape)}개의 내용을 동시에 읽고 있어요...")
-                scraping_tasks = [bot.loop.run_in_executor(None, fetch_webpage_content, url) for url in urls_to_scrape]
-                all_contents = await asyncio.gather(*scraping_tasks)
-                final_search_result = ""
-                for i, content in enumerate(all_contents):
-                    final_search_result += f"\n\n--- [참고 자료 {i+1} (출처: {urls_to_scrape[i]})] ---\n{content}"
-                log.info(f" -> 최종 정보 수집 완료 ({len(urls_to_scrape)}개 자료 분석)")
+                await interaction.edit_original_response(content=f"📄 '{search_query}' 관련 정보를 읽고 있어요...")
+                
+                # [변경] Playwright 스마트 스크래핑 실행 (목표 개수는 3개)
+                valid_contents_list = await smart_scrape_urls(urls_to_scrape, target_count=3)
+                
+                if not valid_contents_list:
+                    final_search_result = "관련 웹페이지를 찾았지만, 내용을 읽어올 수 없었습니다."
+                else:
+                    final_search_result = "\n\n".join(valid_contents_list)
+                    log.info(f" -> 최종 유효 정보 수집 완료 ({len(valid_contents_list)}개 자료)")
 
         base_prompt = f"""
 [상황 정보]
@@ -890,7 +928,7 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
 async def new_chat(interaction: discord.Interaction):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     session_id = interaction.user.id
     if session_id in user_chat_sessions:
         del user_chat_sessions[session_id]
@@ -903,13 +941,13 @@ async def check(interaction: discord.Interaction):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
     if await check_rate_limit(interaction): return
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     await interaction.response.send_message("네, 함장님! 시이는 아주 쌩쌩하게 작동하고 있답니다! 💪")
 
 @bot.tree.command(name="언어목록", description="시이가 번역할 수 있는 언어 목록을 봐요.")
 async def language_list(interaction: discord.Interaction):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     language_info = "\n".join([f"- {name} (`{code}`)" for code, name in supported_languages.items()])
     embed = discord.Embed(title="🌐 시이가 할 수 있는 언어들이에요!", description=language_info, color=discord.Color.teal())
     await interaction.response.send_message(embed=embed)
@@ -920,14 +958,14 @@ async def set_reminder(interaction: discord.Interaction, 내용: str):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
     if await check_rate_limit(interaction): return
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     await interaction.response.send_message("📌 이 약속을 얼마나 자주 알려드릴까요?", view=ReminderFrequencyView(내용), ephemeral=True)
 
 @bot.tree.command(name="알림목록", description="시이가 기억하고 있는 약속 목록을 봐요.")
 async def list_reminders(interaction: discord.Interaction):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     guild_settings = load_settings(str(interaction.guild.id))
     reminders = guild_settings.get("reminders", [])
     if not reminders:
@@ -941,7 +979,7 @@ async def list_reminders(interaction: discord.Interaction):
 async def remove_reminder(interaction: discord.Interaction, 번호: int):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     guild_settings = load_settings(str(interaction.guild.id))
     reminders = guild_settings.get("reminders", [])
     if not 1 <= 번호 <= len(reminders):
@@ -957,7 +995,7 @@ async def remove_reminder(interaction: discord.Interaction, 번호: int):
 async def manual_translate(interaction: discord.Interaction, 언어: str, 텍스트: str):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     await interaction.response.defer(thinking=True)
 
     language_code = 언어.lower()
@@ -991,14 +1029,14 @@ async def manual_translate(interaction: discord.Interaction, 언어: str, 텍스
 @bot.tree.command(name="핑", description="시이의 응답 속도를 측정해요!")
 async def ping(interaction: discord.Interaction):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     latency = round(bot.latency * 1000)
     await interaction.response.send_message(f"시이의 현재 반응 속도는 {latency}ms 랍니다! 🚀")
 
 @bot.tree.command(name="도움말", description="시이가 할 수 있는 모든 것을 알려줘요!")
 async def help_command(interaction: discord.Interaction):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     embed = discord.Embed(title="✨ AI 비서 시이(2.8v) 명령어 도움말 ✨", description="함장님을 위해 시이가 할 수 있는 일들이에요!", color=discord.Color.gold())
     embed.add_field(name="💬 대화 & 정보", value="`/시이야`, `/새대화`, `/핑`, `/확인`", inline=False)
     embed.add_field(name="🌐 번역", value="`/번역`, `/언어목록`, `/번역채널추가`, `/번역채널제거`, `/언어설정`", inline=False)
@@ -1010,15 +1048,23 @@ async def help_command(interaction: discord.Interaction):
 @bot.tree.command(name="서버정보", description="현재 서버의 이름과 고유 ID를 확인해요!")
 async def server_info(interaction: discord.Interaction):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(
+        f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})"
+    )
+
     if not interaction.guild:
-        await interaction.response.send_message("이 명령어는 서버 안에서만 사용할 수 있어요!", ephemeral=True)
+        await interaction.response.send_message(
+            "이 명령어는 서버 안에서만 사용할 수 있어요!", ephemeral=True
+        )
         return
-    server_name = interaction.guild.name
-    server_id = interaction.guild.id
+
+    server_name = interaction.guild.name if interaction.guild else "DM"
+    server_id = interaction.guild.id if interaction.guild else "N/A"
+
     embed = discord.Embed(title="📜 서버 정보예요!", color=discord.Color.blue())
     embed.add_field(name="🏢 서버 이름", value=server_name, inline=False)
     embed.add_field(name="🔑 고유 ID", value=str(server_id), inline=False)
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # --- 서버 관리자 전용 명령어 ---
@@ -1026,7 +1072,7 @@ async def server_info(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def set_main_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     guild_settings = load_settings(str(interaction.guild.id))
     guild_settings["translation_channel"] = 채널.id
     save_settings(str(interaction.guild.id), guild_settings)
@@ -1036,7 +1082,7 @@ async def set_main_channel(interaction: discord.Interaction, 채널: discord.Tex
 @app_commands.default_permissions(administrator=True)
 async def check_settings(interaction: discord.Interaction):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     guild_settings = load_settings(str(interaction.guild.id))
     source_channels_ids = guild_settings.get("source_channels", [])
     main_channel_id = guild_settings.get("translation_channel")
@@ -1052,7 +1098,7 @@ async def check_settings(interaction: discord.Interaction):
 async def add_source_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     guild_settings = load_settings(str(interaction.guild.id))
     if 채널.id not in guild_settings.get("source_channels", []):
         guild_settings.setdefault("source_channels", []).append(채널.id)
@@ -1066,7 +1112,7 @@ async def add_source_channel(interaction: discord.Interaction, 채널: discord.T
 async def remove_source_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     guild_settings = load_settings(str(interaction.guild.id))
     if 채널.id in guild_settings.get("source_channels", []):
         guild_settings["source_channels"].remove(채널.id)
@@ -1081,7 +1127,7 @@ async def remove_source_channel(interaction: discord.Interaction, 채널: discor
 async def set_language(interaction: discord.Interaction, 언어: str):
     if not await check_setup(interaction): return
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     guild_settings = load_settings(str(interaction.guild.id))
     language_code = 언어.lower()
     if language_code not in supported_languages:
@@ -1096,7 +1142,7 @@ async def set_language(interaction: discord.Interaction, 언어: str):
 @app_commands.describe(채널="메시지를 보낼 채널", 메시지="보낼 내용")
 async def broadcast(interaction: discord.Interaction, 채널: discord.TextChannel, 메시지: str):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     try:
         await 채널.send(메시지)
         await interaction.response.send_message(f"✅ `#{채널.name}` 채널에 공지를 성공적으로 보냈어요!", ephemeral=True)
@@ -1108,7 +1154,7 @@ async def broadcast(interaction: discord.Interaction, 채널: discord.TextChanne
 @app_commands.default_permissions(administrator=True)
 async def reset_channels(interaction: discord.Interaction):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     guild_settings = load_settings(str(interaction.guild.id))
     guild_settings["source_channels"] = []
     save_settings(str(interaction.guild.id), guild_settings)
@@ -1120,7 +1166,7 @@ async def reset_channels(interaction: discord.Interaction):
 @app_commands.check(is_bot_owner)
 async def broadcast_all(interaction: discord.Interaction, 메시지: str):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     await interaction.response.defer(ephemeral=True, thinking=True)
     success_count, fail_count = 0, 0
     for guild in bot.guilds:
@@ -1160,7 +1206,7 @@ async def set_log_channel(interaction: discord.Interaction, 채널: discord.Text
 @app_commands.check(is_bot_owner)
 async def block_target(interaction: discord.Interaction, 아이디: str):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     try:
         target_id = int(아이디)
         blacklist = load_blacklist()
@@ -1185,7 +1231,7 @@ async def block_target(interaction: discord.Interaction, 아이디: str):
 @app_commands.check(is_bot_owner)
 async def unblock_target(interaction: discord.Interaction, 아이디: str):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     try:
         target_id = int(아이디)
         blacklist = load_blacklist()
@@ -1206,7 +1252,7 @@ async def unblock_target(interaction: discord.Interaction, 아이디: str):
 @app_commands.check(is_bot_owner)
 async def list_all_servers(interaction: discord.Interaction):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     server_list = [f"🏢 **{guild.name}**\n    - ID: `{guild.id}`" for guild in bot.guilds]
     if not server_list:
         await interaction.response.send_message("아무 서버에도 접속해있지 않아요!", ephemeral=True)
@@ -1220,7 +1266,7 @@ async def list_all_servers(interaction: discord.Interaction):
 @app_commands.check(is_bot_owner)
 async def spam_test(interaction: discord.Interaction, 횟수: int = 15, 간격: float = 0.1):
     record_server_usage(interaction)
-    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name}, 사용자: {interaction.user})")
+    log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
     await interaction.response.send_message(f"`{횟수}`회 가상 요청 테스트를 시작합니다...", ephemeral=True)
     for i in range(횟수):
         if await check_rate_limit(interaction):
