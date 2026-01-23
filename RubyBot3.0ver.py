@@ -254,6 +254,9 @@ def setup_search_tools():
         log.error(f"[초기화] Google 검색 도구 설정 중 오류 발생: {e}")
         return None
 
+# ▼▼▼ [핵심 변경] Playwright 기반 스마트 스크래핑 함수 구현 ▼▼▼
+# 기존 requests + BeautifulSoup 방식은 제거되었습니다.
+
 async def smart_scrape_urls(urls: list[str], target_count: int = 3) -> list[str]:
     """
     Playwright를 사용하여 URL 목록을 순회하며 내용을 수집합니다.
@@ -740,7 +743,6 @@ WEEKLY_SEARCH_LIMIT = 150 # 서버당 주간 무료 검색 횟수 제한
 @bot.tree.command(name="시이야", description="시이에게 궁금한 것을 물어보세요!")
 @app_commands.describe(질문="시이에게 할 질문 내용을 적어주세요!")
 async def ask_shii(interaction: discord.Interaction, 질문: str):
-    # 1. 기본 체크 (설정, 블랙리스트, 과부하)
     if not await check_setup(interaction): return
     record_server_usage(interaction)
     blacklist = load_blacklist()
@@ -749,18 +751,14 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
     if await check_rate_limit(interaction): return
 
     log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
-    
-    # 생각 중 상태 표시 (최대 15분 대기 가능)
     await interaction.response.defer(thinking=True)
 
-    # 2. 세션 관리
     session_id = interaction.user.id
     if session_id not in user_chat_sessions:
         user_chat_sessions[session_id] = chat_model.start_chat(history=[])
     
     chat_session = user_chat_sessions[session_id]
     
-    # 3. 히스토리 및 시간 정보 준비
     history = chat_session.history
     current_time_str = get_kst_now().strftime("%Y년 %m월 %d일 %H시 %M분")
     log.info(f" -> 현재 KST: {current_time_str}, 대화 기록 수: {len(history)}")
@@ -771,44 +769,52 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
     
     url_match = URL_PATTERN.search(질문)
 
-    # 4. 분기 처리 (URL 분석 vs 일반 검색)
     if url_match:
-        # --- [Case A] URL 분석 로직 ---
+        # --- 1. URL 분석 로직 (Playwright 적용) ---
         user_url = url_match.group(0)
         log.info(f"-> URL 감지: '{user_url}'. URL 우선 분석을 시작합니다.")
         await interaction.edit_original_response(content=f"📄 보내주신 링크의 내용을 분석하고 있어요...\n> {user_url}")
         
-        # Playwright 스마트 스크래핑
+        # [변경] Playwright 스마트 스크래핑 사용 (단일 URL이지만 리스트로 전달)
         scraped_contents = await smart_scrape_urls([user_url], target_count=1)
+        
+        # 리스트로 반환되므로 내용을 꺼내야 함. 실패시 빈 문자열 처리
         final_search_result = scraped_contents[0] if scraped_contents else f"[분석 실패] 해당 링크({user_url})의 내용을 읽을 수 없습니다."
 
         base_prompt = f"""
 [상황 정보]
-- 현재 시각: {current_time_str} KST
+- 현재 시각: {{current_time_str}} KST
 [사용자의 최근 질문 및 제공한 링크]
-- 질문: "{질문}"
-- 링크: "{user_url}"
+- 질문: "{{질문}}"
+- 링크: "{{user_url}}"
 [내가 사용자가 제공한 링크에서 추출한 정보]
 ---
-{final_search_result}
+{{search_result_placeholder}}
 ---
 [나의 임무]
 너는 이제부터 **'사실 확인 전문가(Fact Checker)'** 역할을 수행해야 한다.
 1. '사용자의 질문'과 '사용자가 제공한 링크에서 추출한 정보'를 비교 분석하라.
 2. 추출된 정보를 바탕으로 사용자의 주장이 맞는지, 틀리는지, 혹은 어떤 오해가 있는지 판단하라.
 3. 사용자의 주장이 틀렸거나 오해가 있다면, 절대 공격적으로 지적하지 말고 부드럽고 친절한 말투로 어떤 부분이 다른지 설명해주어라.
-**[출력 규칙]**
-분석 결과가 길어지더라도 중간에 끊지 말고, 전체 내용을 한 번에 모두 출력하라. (시스템이 자동으로 분할하여 전송함)
 """
-        processed_question = base_prompt
+        processed_question = base_prompt.format(
+            current_time_str=current_time_str,
+            질문=질문,
+            user_url=user_url,
+            search_result_placeholder=final_search_result
+        )
         log_summary = f"[... 총 {len(final_search_result.encode('utf-8'))} bytes의 웹페이지 정보 생략 ...]"
-        processed_question_for_log = base_prompt.replace(final_search_result, log_summary)
+        processed_question_for_log = base_prompt.format(
+            current_time_str=current_time_str,
+            질문=질문,
+            user_url=user_url,
+            search_result_placeholder=log_summary
+        )
 
     else:
-        # --- [Case B] 일반 검색 로직 ---
+        # --- 2. 일반 검색 로직 (Playwright 적용) ---
         log.info(f"-> '일반 검색' 의도 감지: '{질문}'. 선제적 검색을 시작합니다.")
         
-        # [주간 검색 제한 체크]
         if interaction.guild:
             current_time = get_kst_now()
             guild_id_str = str(interaction.guild.id)
@@ -820,7 +826,6 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
             if last_reset_week != current_week:
                 settings["search_usage_weekly"] = 0
                 settings["last_reset_week"] = current_week
-                settings["last_reset_week_year"] = current_time.year # 연도 체크 추가 권장되지만 일단 유지
                 log.info(f"-> [서버: {interaction.guild.name if interaction.guild else 'DM'}] 주간 검색 횟수가 초기화되었습니다.")
 
             search_usage = settings.get("search_usage_weekly", 0)
@@ -837,7 +842,6 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
         
         await interaction.edit_original_response(content="🤔 질문의 핵심을 파악하고 있어요...")
         
-        # 검색어 및 기간 필터 추출
         search_query, date_restrict_option = await get_search_query_from_gemini(질문, history_for_prompt, current_time_str)
 
         if date_restrict_option:
@@ -845,7 +849,7 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
         else:
             await interaction.edit_original_response(content=f"🔍 '{search_query}' 관련 정보를 찾고 있어요...")
         
-        # 구글 검색 수행
+        # [변경] 검색 개수를 6개로 넉넉하게 잡음 (불량 링크 필터링 대비)
         search_results = await custom_google_search(search_query, num_results=6, date_restrict=date_restrict_option)
 
         if not search_results:
@@ -860,7 +864,7 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
             else:
                 await interaction.edit_original_response(content=f"📄 '{search_query}' 관련 정보를 읽고 있어요...")
                 
-                # Playwright 스마트 스크래핑
+                # [변경] Playwright 스마트 스크래핑 실행 (목표 개수는 3개)
                 valid_contents_list = await smart_scrape_urls(urls_to_scrape, target_count=3)
                 
                 if not valid_contents_list:
@@ -871,12 +875,12 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
 
         base_prompt = f"""
 [상황 정보]
-- 현재 시각: {current_time_str} KST
+- 현재 시각: {{current_time_str}} KST
 [사용자의 최근 질문]
-"{질문}"
+"{{질문}}"
 [내가 미리 찾아본 관련 정보]
 ---
-{final_search_result}
+{{search_result_placeholder}}
 ---
 [나의 임무]
 너는 이제부터 여러 개의 정보 소스를 종합하여 분석하는 **'수석 정보 분석가'** 역할을 수행해야 한다.
@@ -885,74 +889,35 @@ async def ask_shii(interaction: discord.Interaction, 질문: str):
 2. **교차 검증 및 핵심 사실 추출:** 여러 소스에서 공통적으로 언급하는 핵심 사실이 무엇인지 먼저 찾아내라. 만약 관련 정보가 없다면, 사용자의 질문이 단순 대화인지 판단하고 그에 맞게 응답하라.
 3. **정보 충돌 처리:** 만약 정보들이 서로 충돌하거나 상반된 의견이 있다면, 양쪽의 내용을 함께 언급해주어라.
 4. **최종 답변 재구성:** 분석된 결론을 바탕으로, 사용자의 질문에 대한 하나의 완전하고 논리적인 답변으로 재구성하라.
-**[출력 규칙 (매우 중요)]**
-**답변이 길어질 경우 절대 중간에 끊거나 '다음 내용을 보시겠습니까?'라고 묻지 말고, Part 1, 2, 3 등 전체 내용을 한 번에 모두 출력하라.**
-(시스템이 자동으로 메시지를 나누어 전송하므로 글자 수 제한을 신경 쓰지 마라.)
 """
-        processed_question = base_prompt
+        processed_question = base_prompt.format(
+            current_time_str=current_time_str,
+            질문=질문,
+            search_result_placeholder=final_search_result.strip()
+        )
         log_summary = f"[... 총 {len(final_search_result.strip().encode('utf-8'))} bytes의 웹페이지 정보 생략 ...]"
-        processed_question_for_log = base_prompt.replace(final_search_result, log_summary)
+        processed_question_for_log = base_prompt.format(
+            current_time_str=current_time_str,
+            질문=질문,
+            search_result_placeholder=log_summary
+        )
     
-    # 5. 답변 생성 요청 (여기서 긴 텍스트를 한 번에 받습니다)
-    await interaction.edit_original_response(content="✍️ 시이가 답변을 작성하고 있어요... (내용이 길면 나눠서 보내드릴게요!)")
+    await interaction.edit_original_response(content="📝 찾은 정보를 종합해서 정리하고 있어요...")
 
     answer = await ask_gemini_chat(interaction, interaction.user, processed_question, log_prompt=processed_question_for_log)
-    log.info(f"-> 시이 답변 생성 완료 (총 길이: {len(answer)}자)")
+    log.info(f"-> 시이 답변 (대상: {interaction.user}): '{answer}'")
 
-    # 6. 스마트 자르기 로직 (Smart Splitting)
-    # 디스코드 제한(2000자)을 고려하여 1900자 단위로 자르되, 가급적 줄바꿈(\n) 위치에서 자릅니다.
-    chunks = []
-    remaining_text = answer
-    
-    while len(remaining_text) > 0:
-        if len(remaining_text) <= 1900:
-            chunks.append(remaining_text)
-            break
-        else:
-            # 1900자 근처의 마지막 줄바꿈을 찾음
-            split_index = remaining_text.rfind('\n', 0, 1900)
-            
-            if split_index == -1: # 줄바꿈이 없으면 공백을 찾음
-                split_index = remaining_text.rfind(' ', 0, 1900)
-            
-            if split_index == -1: # 공백도 없으면 강제로 자름
-                split_index = 1900
-            
-            chunks.append(remaining_text[:split_index])
-            remaining_text = remaining_text[split_index:].strip() # 자른 부분 이후부터 다시 시작
-
-    # 7. 연속 발송 로직
-    if not chunks:
-        # 혹시라도 내용이 비어있을 경우 예외 처리
-        await interaction.followup.send("음... 답변을 생성하지 못했어요. 다시 질문해 주시겠어요?")
-        return
-
-    # 첫 번째 청크: 메인 Embed로 전송
-    first_chunk = chunks.pop(0)
     embed = discord.Embed(title="✨ 시이의 답변이 도착했어요!", color=discord.Color.from_rgb(139, 195, 74))
-    embed.set_author(name=f"{interaction.user.display_name} 함장님", icon_url=interaction.user.display_avatar.url)
-    
-    # 질문 내용이 너무 길면 잘라서 표시
-    short_question = 질문[:90] + "..." if len(질문) > 90 else 질문
-    embed.add_field(name="❓ 질문", value=f"```{short_question}```", inline=False)
-    
-    # 답변 본문 삽입
-    embed.description = first_chunk
-    
-    # edit_original_response 대신 followup.send 사용 (이미 defer 상태이므로)
-    await interaction.followup.send(embed=embed)
+    embed.set_author(name=f"{interaction.user.display_name} 함장님의 질문", icon_url=interaction.user.display_avatar.url)
+    embed.add_field(name="❓ 질문 내용", value=f"```{질문}```", inline=False)
 
-    # 나머지 청크: 이어지는 Embed로 순차 전송
-    if chunks:
-        for idx, chunk in enumerate(chunks, 1):
-            await asyncio.sleep(1.0) # 디스코드 메시지 순서 꼬임 방지를 위한 딜레이
-            
-            followup_embed = discord.Embed(description=chunk, color=discord.Color.from_rgb(139, 195, 74))
-            followup_embed.set_footer(text=f"이어지는 내용 ({idx}/{len(chunks)})")
-            
-            await interaction.followup.send(embed=followup_embed)
-
-    log.info(f"-> 답변 전송 완료 (총 {len(chunks) + 1}개 메시지로 분할 전송)")
+    if len(answer) <= 1024:
+        embed.add_field(name="💫 시이의 답변", value=answer, inline=False)
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send(embed=embed)
+        for i in range(0, len(answer), 2000):
+            await interaction.followup.send(content=answer[i:i+2000])
 
 
 @bot.tree.command(name="새대화", description="시이와의 대화 기록을 초기화하고 새로운 대화를 시작해요.")
@@ -1068,7 +1033,7 @@ async def ping(interaction: discord.Interaction):
 async def help_command(interaction: discord.Interaction):
     record_server_usage(interaction)
     log.info(f"/{interaction.command.name} (서버: {interaction.guild.name if interaction.guild else 'DM'}, 사용자: {interaction.user})")
-    embed = discord.Embed(title="✨ AI 비서 시이(3.0v) 명령어 도움말 ✨", description="함장님을 위해 시이가 할 수 있는 일들이에요!", color=discord.Color.gold())
+    embed = discord.Embed(title="✨ AI 비서 시이(2.8v) 명령어 도움말 ✨", description="함장님을 위해 시이가 할 수 있는 일들이에요!", color=discord.Color.gold())
     embed.add_field(name="💬 대화 & 정보", value="`/시이야`, `/새대화`, `/핑`, `/확인`", inline=False)
     embed.add_field(name="🌐 번역", value="`/번역`, `/언어목록`, `/번역채널추가`, `/번역채널제거`, `/언어설정`", inline=False)
     embed.add_field(name="⏰ 알림", value="`/알림`, `/알림목록`, `/알림삭제`", inline=False)
