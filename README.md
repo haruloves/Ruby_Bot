@@ -2,6 +2,9 @@
 [https://url.kr/j88e9o](https://url.kr/j88e9o)  
 명령어들은 "/도움말" 을 입력해주세요.    
 > (현재는 Gemini-3.5-Flash 기반 '3.3v'만 운영합니다.)
+
+웹 대시보드 페이지를 오픈했습니다
+[https://hifumi.kr/ruby](https://hifumi.kr/ruby)
 　  
 # 기능 소개
 ## 자동 번역
